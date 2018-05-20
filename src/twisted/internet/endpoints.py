@@ -23,23 +23,21 @@ import warnings
 from constantly import NamedConstant, Names
 from incremental import Version
 
-from zope.interface import implementer, directlyProvides, provider
+from zope.interface import implementer, directlyProvides
 
 from twisted.internet import interfaces, defer, error, fdesc, threads
 from twisted.internet.abstract import isIPv6Address, isIPAddress
-from twisted.internet.address import (
-    _ProcessAddress, HostnameAddress, IPv4Address, IPv6Address
-)
+from twisted.internet.address import _ProcessAddress, IPv6Address, IPv4Address
 from twisted.internet.interfaces import (
     IStreamServerEndpointStringParser,
-    IStreamClientEndpointStringParserWithReactor, IResolutionReceiver,
+    IStreamClientEndpointStringParserWithReactor,
     IReactorPluggableNameResolver,
     IHostnameResolver,
 )
 from twisted.internet.protocol import ClientFactory, Factory
 from twisted.internet.protocol import ProcessProtocol, Protocol
 from twisted.internet.stdio import StandardIO, PipeAddress
-from twisted.internet.task import LoopingCall
+
 from twisted.internet._resolver import HostResolution
 from twisted.logger import Logger
 from twisted.plugin import IPlugin, getPlugins
@@ -49,10 +47,11 @@ from twisted.python.components import proxyForInterface
 from twisted.python.failure import Failure
 from twisted.python.filepath import FilePath
 from twisted.python.compat import iterbytes
-from twisted.internet.defer import Deferred
+
 from twisted.python.systemd import ListenFDs
 
 from ._idna import _idnaBytes, _idnaText
+from ._statefulhost import _HostnameConnectionAttempt
 
 try:
     from twisted.protocols.tls import TLSMemoryBIOFactory
@@ -781,7 +780,6 @@ class HostnameEndpoint(object):
 
         @see: L{twisted.internet.interfaces.IReactorTCP.connectTCP}
         """
-
         self._reactor = reactor
         self._nameResolver = self._getNameResolverAndMaybeWarn(reactor)
         [self._badHostname, self._hostBytes, self._hostText] = (
@@ -893,153 +891,35 @@ class HostnameEndpoint(object):
         Attempts a connection to each resolved address, and returns a
         connection which is established first.
 
-        @param protocolFactory: The protocol factory whose protocol
-            will be connected.
+        @param protocolFactory: The protocol factory whose protocol will be
+            connected.
         @type protocolFactory:
             L{IProtocolFactory<twisted.internet.interfaces.IProtocolFactory>}
 
-        @return: A L{Deferred} that fires with the connected protocol
-            or fails a connection-related error.
+        @return: A L{Deferred} that fires with the connected protocol or fails
+            a connection-related error.
         """
         if self._badHostname:
             return defer.fail(
                 ValueError("invalid hostname: {}".format(self._hostStr))
             )
-
-        d = Deferred()
-        addresses = []
-        @provider(IResolutionReceiver)
-        class EndpointReceiver(object):
-            @staticmethod
-            def resolutionBegan(resolutionInProgress):
-                pass
-            @staticmethod
-            def addressResolved(address):
-                addresses.append(address)
-            @staticmethod
-            def resolutionComplete():
-                d.callback(addresses)
-
-        self._nameResolver.resolveHostName(
-            EndpointReceiver, self._hostText, portNumber=self._port
-        )
-
-        d.addErrback(lambda ignored: defer.fail(error.DNSLookupError(
-            "Couldn't find the hostname '{}'".format(self._hostStr))))
-        @d.addCallback
-        def resolvedAddressesToEndpoints(addresses):
-            # Yield an endpoint for every address resolved from the name.
-            for eachAddress in addresses:
-                if isinstance(eachAddress, IPv6Address):
-                    yield TCP6ClientEndpoint(
-                        self._reactor, eachAddress.host, eachAddress.port,
-                        self._timeout, self._bindAddress
-                    )
-                if isinstance(eachAddress, IPv4Address):
-                    yield TCP4ClientEndpoint(
-                        self._reactor, eachAddress.host, eachAddress.port,
-                        self._timeout, self._bindAddress
-                    )
-        d.addCallback(list)
-
-        def _canceller(d):
-            # This canceller must remain defined outside of
-            # `startConnectionAttempts`, because Deferred should not
-            # participate in cycles with their cancellers; that would create a
-            # potentially problematic circular reference and possibly
-            # gc.garbage.
-            d.errback(error.ConnectingCancelledError(
-                HostnameAddress(self._hostBytes, self._port)))
-
-        @d.addCallback
-        def startConnectionAttempts(endpoints):
-            """
-            Given a sequence of endpoints obtained via name resolution, start
-            connecting to a new one every C{self._attemptDelay} seconds until
-            one of the connections succeeds, all of them fail, or the attempt
-            is cancelled.
-
-            @param endpoints: a list of all the endpoints we might try to
-                connect to, as determined by name resolution.
-            @type endpoints: L{list} of L{IStreamServerEndpoint}
-
-            @return: a Deferred that fires with the result of the
-                C{endpoint.connect} method that completes the fastest, or fails
-                with the first connection error it encountered if none of them
-                succeed.
-            @rtype: L{Deferred} failing with L{error.ConnectingCancelledError}
-                or firing with L{IProtocol}
-            """
-            if not endpoints:
-                raise error.DNSLookupError(
-                    "no results for hostname lookup: {}".format(self._hostStr)
-                )
-            iterEndpoints = iter(endpoints)
-            pending = []
-            failures = []
-            winner = defer.Deferred(canceller=_canceller)
-
-            def checkDone():
-                if pending or checkDone.completed or checkDone.endpointsLeft:
-                    return
-                winner.errback(failures.pop())
-            checkDone.completed = False
-            checkDone.endpointsLeft = True
-
-            @LoopingCall
-            def iterateEndpoint():
-                endpoint = next(iterEndpoints, None)
-                if endpoint is None:
-                    # The list of endpoints ends.
-                    checkDone.endpointsLeft = False
-                    checkDone()
-                    return
-
-                eachAttempt = endpoint.connect(protocolFactory)
-                pending.append(eachAttempt)
-                @eachAttempt.addBoth
-                def noLongerPending(result):
-                    pending.remove(eachAttempt)
-                    return result
-                @eachAttempt.addCallback
-                def succeeded(result):
-                    winner.callback(result)
-                @eachAttempt.addErrback
-                def failed(reason):
-                    failures.append(reason)
-                    checkDone()
-
-            iterateEndpoint.clock = self._reactor
-            iterateEndpoint.start(self._attemptDelay)
-
-            @winner.addBoth
-            def cancelRemainingPending(result):
-                checkDone.completed = True
-                for remaining in pending[:]:
-                    remaining.cancel()
-                if iterateEndpoint.running:
-                    iterateEndpoint.stop()
-                return result
-            return winner
-
-        return d
+        return _HostnameConnectionAttempt(self, protocolFactory).start()
 
 
     def _fallbackNameResolution(self, host, port):
         """
-        Resolve the hostname string into a tuple containing the host
-        address.  This is method is only used when the reactor does
-        not provide L{IReactorPluggableNameResolver}.
+        Resolve the hostname string into a tuple containing the host address.
+        This is method is only used when the reactor does not provide
+        L{IReactorPluggableNameResolver}.
 
         @param host: A unicode hostname to resolve.
 
         @param port: The port to include in the resolution.
 
-        @return: A L{Deferred} that fires with L{_getaddrinfo}'s
-            return value.
+        @return: A L{Deferred} that fires with L{_getaddrinfo}'s return value.
         """
         return self._deferToThread(self._getaddrinfo, host, port, 0,
-                socket.SOCK_STREAM)
+                                   socket.SOCK_STREAM)
 
 
 
